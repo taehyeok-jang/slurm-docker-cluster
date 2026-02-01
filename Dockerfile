@@ -24,6 +24,8 @@ RUN set -ex \
        autoconf \
        automake \
        bzip2 \
+       jansson-devel \
+       libtool \
        freeipmi-devel \
        dbus-devel \
        gcc \
@@ -61,21 +63,37 @@ RUN set -ex \
 # Setup RPM build environment
 RUN rpmdev-setuptree
 
+# Build and install libjwt so Slurm can be built with auth_jwt plugin (AuthAltTypes=auth/jwt)
+# See https://slurm.schedmd.com/related_software.html#jwt (libjwt >= v1.10.0)
+RUN set -ex \
+    && git clone --depth 1 --single-branch -b v1.12.0 https://github.com/benmcollins/libjwt.git /tmp/libjwt \
+    && cd /tmp/libjwt \
+    && autoreconf --force --install \
+    && ./configure --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig \
+    && (cp -n /usr/local/lib64/libjwt* /usr/local/lib/ 2>/dev/null || true) \
+    && (cp -n /usr/local/lib/libjwt* /usr/local/lib64/ 2>/dev/null || true) \
+    && rm -rf /tmp/libjwt
+
 # Copy RPM macros
 COPY rpmbuild/slurm.rpmmacros /root/.rpmmacros
 
-# Download official Slurm release tarball and build RPMs with slurmrestd enabled
-# Architecture mapping: Docker TARGETARCH (amd64, arm64) -> RPM arch (x86_64, aarch64)
+# Download official Slurm release tarball and build RPMs with slurmrestd and JWT enabled
+# libjwt must be installed so Slurm's configure enables auth_jwt; set PKG_CONFIG_PATH so rpmbuild finds it.
 RUN set -ex \
     && RPM_ARCH=$(case "${TARGETARCH}" in \
          amd64) echo "x86_64" ;; \
          arm64) echo "aarch64" ;; \
          *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
        esac) \
-    && echo "Building Slurm RPMs for architecture: ${RPM_ARCH}" \
+    && echo "Building Slurm RPMs for architecture: ${RPM_ARCH} (with JWT support)" \
     && wget -O /root/rpmbuild/SOURCES/slurm-${SLURM_VERSION}.tar.bz2 \
        https://download.schedmd.com/slurm/slurm-${SLURM_VERSION}.tar.bz2 \
     && cd /root/rpmbuild/SOURCES \
+    && export PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+    && export LD_LIBRARY_PATH="/usr/local/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}" \
     && rpmbuild -ta slurm-${SLURM_VERSION}.tar.bz2 \
     && ls -lh /root/rpmbuild/RPMS/${RPM_ARCH}/
 
@@ -100,15 +118,17 @@ RUN set -ex \
     && dnf config-manager --set-enabled crb \
     && dnf makecache
 
-# Install runtime dependencies only
+# Install runtime dependencies only (including golang for Go programs in slurmctld)
 RUN set -ex \
     && dnf -y install \
        bash-completion \
        bzip2 \
        gettext \
+       golang \
        hdf5 \
        http-parser \
        hwloc \
+       jansson \
        json-c \
        jq \
        libaec \
@@ -144,9 +164,19 @@ RUN set -ex \
 
 COPY --from=builder /root/rpmbuild/RPMS/*/*.rpm /tmp/rpms/
 
-# Install Slurm RPMs
+# Copy libjwt from builder first so it is present before Slurm RPM install.
+# Slurm RPMs were built with JWT support and require libjwt.so.0; we provide it
+# from our build. Install Slurm with --nodeps so rpm does not require libjwt
+# to be in the package database. Register /usr/local so the dynamic linker finds libjwt.
+RUN mkdir -p /usr/local/lib64
+COPY --from=builder /usr/local/lib64/libjwt* /usr/local/lib64/
+RUN echo '/usr/local/lib64' > /etc/ld.so.conf.d/local.conf \
+    && echo '/usr/local/lib' >> /etc/ld.so.conf.d/local.conf \
+    && ldconfig
+
+# Install Slurm RPMs (--nodeps: libjwt is already on disk above)
 RUN set -ex \
-    && dnf -y install /tmp/rpms/slurm-[0-9]*.rpm \
+    && rpm -Uvh --nodeps /tmp/rpms/slurm-[0-9]*.rpm \
        /tmp/rpms/slurm-perlapi-*.rpm \
        /tmp/rpms/slurm-slurmctld-*.rpm \
        /tmp/rpms/slurm-slurmd-*.rpm \
@@ -163,12 +193,16 @@ RUN set -ex \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
-# Create slurm user and group
+# Create slurm user and group. slurmrestd must NOT run with SlurmUser's group (slurm).
+# Use a shared group slurmjwt so both slurm (slurmctld) and slurmrest (slurmrestd) can read the JWT key.
 RUN set -x \
     && groupadd -r --gid=990 slurm \
     && useradd -r -g slurm --uid=990 slurm \
     && groupadd -r --gid=991 slurmrest \
-    && useradd -r -g slurmrest --uid=991 slurmrest
+    && useradd -r -g slurmrest --uid=991 slurmrest \
+    && groupadd -r --gid=992 slurmjwt \
+    && usermod -a -G slurmjwt slurm \
+    && usermod -a -G slurmjwt slurmrest
 
 # Fix /etc permissions and create munge key
 RUN set -x \
@@ -218,7 +252,8 @@ RUN set -ex \
 COPY --chown=slurm:slurm --chmod=0600 examples /root/examples
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY init-jwt-key.sh /usr/local/bin/init-jwt-key.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/init-jwt-key.sh
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 

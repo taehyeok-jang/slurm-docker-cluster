@@ -1,6 +1,33 @@
 #!/bin/bash
 set -e
 
+# Check if auth_jwt plugin is available (for slurmdbd/slurmctld)
+check_jwt_auth_plugin() {
+    echo "---> Checking for JWT authentication plugin..."
+    JWT_PLUGIN_AVAILABLE=false
+    for PLUGIN_DIR in /usr/lib/slurm /usr/lib64/slurm /usr/libexec/slurm; do
+        if [ -f "${PLUGIN_DIR}/auth_jwt.so" ] || [ -f "${PLUGIN_DIR}/auth_jwt" ]; then
+            JWT_PLUGIN_AVAILABLE=true
+            break
+        fi
+    done
+}
+
+# Remove JWT config from a Slurm config file if JWT plugin is not available
+strip_jwt_from_conf() {
+    echo "---> Stripping JWT configuration from $1"
+    local conf_file="$1"
+    if [ "$JWT_PLUGIN_AVAILABLE" != "true" ]; then
+        echo "---> JWT plugin not available, removing JWT configuration from $conf_file"
+        sed '/^AuthType=auth\/jwt$/d; /^AuthAltTypes=auth\/jwt/d; /^AuthAltParameters=jwt_key=/d' \
+            "$conf_file" > "${conf_file}.tmp"
+        mv "${conf_file}.tmp" "$conf_file"
+        if ! grep -q "^AuthType=" "$conf_file"; then
+            echo "AuthType=auth/munge" >> "$conf_file"
+        fi
+    fi
+}
+
 echo "---> Starting the MUNGE Authentication service (munged) ..."
 gosu munge /usr/sbin/munged
 
@@ -8,9 +35,21 @@ if [ "$1" = "slurmdbd" ]
 then
     echo "---> Starting the Slurm Database Daemon (slurmdbd) ..."
 
+    check_jwt_auth_plugin
+    [ "$JWT_PLUGIN_AVAILABLE" = "true" ] && echo "---> JWT authentication plugin found"
+
+    if [ "$JWT_PLUGIN_AVAILABLE" = "true" ] && [ ! -f /var/lib/slurm/jwt_hs256.key ]; then
+        echo "---> Creating JWT key for slurmdbd..."
+        /usr/local/bin/init-jwt-key.sh /var/lib/slurm
+    fi
+    [ -f /var/lib/slurm/jwt_hs256.key ] && chgrp slurmjwt /var/lib/slurm/jwt_hs256.key && chmod 0640 /var/lib/slurm/jwt_hs256.key
+
     # Substitute environment variables in slurmdbd.conf
     envsubst < /etc/slurm/slurmdbd.conf > /etc/slurm/slurmdbd.conf.tmp
     mv /etc/slurm/slurmdbd.conf.tmp /etc/slurm/slurmdbd.conf
+
+    # strip_jwt_from_conf /etc/slurm/slurmdbd.conf
+
     chown slurm:slurm /etc/slurm/slurmdbd.conf
     chmod 600 /etc/slurm/slurmdbd.conf
 
@@ -37,6 +76,15 @@ then
     done
     echo "-- slurmdbd is now active ..."
 
+    check_jwt_auth_plugin
+    [ "$JWT_PLUGIN_AVAILABLE" = "true" ] && echo "---> JWT authentication plugin found (slurmctld check)"
+
+    if [ "$JWT_PLUGIN_AVAILABLE" = "true" ] && [ ! -f /var/lib/slurm/jwt_hs256.key ]; then
+        echo "---> Creating JWT key for slurmctld..."
+        /usr/local/bin/init-jwt-key.sh /var/lib/slurm
+    fi
+    [ -f /var/lib/slurm/jwt_hs256.key ] && chgrp slurmjwt /var/lib/slurm/jwt_hs256.key && chmod 0640 /var/lib/slurm/jwt_hs256.key
+
     echo "---> Starting the Slurm Controller Daemon (slurmctld) ..."
     exec gosu slurm /usr/sbin/slurmctld -i -Dvvv
 fi
@@ -52,13 +100,58 @@ then
     done
     echo "-- slurmctld is now active ..."
 
+    # Check available REST authentication plugins
+    JWT_PLUGIN_AVAILABLE=false
+    MUNGE_PLUGIN_AVAILABLE=false
+    
+    for PLUGIN_DIR in /usr/lib/slurm /usr/lib64/slurm /usr/libexec/slurm; do
+        # Check for JWT plugin
+        if [ -f "${PLUGIN_DIR}/rest_auth_jwt.so" ] || [ -f "${PLUGIN_DIR}/rest_auth/jwt.so" ] || \
+           [ -f "${PLUGIN_DIR}/rest_auth_jwt" ] || [ -f "${PLUGIN_DIR}/rest_auth/jwt" ]; then
+            JWT_PLUGIN_AVAILABLE=true
+        fi
+        # Check for MUNGE/local plugin
+        if [ -f "${PLUGIN_DIR}/rest_auth_local.so" ] || [ -f "${PLUGIN_DIR}/rest_auth/local.so" ] || \
+           [ -f "${PLUGIN_DIR}/rest_auth_local" ] || [ -f "${PLUGIN_DIR}/rest_auth/local" ]; then
+            MUNGE_PLUGIN_AVAILABLE=true
+        fi
+    done
+
     echo "---> Starting the Slurm REST API Daemon (slurmrestd) ..."
     # Run slurmrestd on both Unix socket and network port
     # Unix socket provides passwordless local access
     # Note: slurmrestd should NOT be run as SlurmUser or root (security requirement)
     mkdir -p /var/run/slurmrestd
     chown slurmrest:slurmrest /var/run/slurmrestd
-    exec gosu slurmrest /usr/sbin/slurmrestd -vvv unix:/var/run/slurmrestd/slurmrestd.socket 0.0.0.0:6820
+    
+    # Determine authentication plugins to use
+    AUTH_PLUGINS=""
+    if [ "$JWT_PLUGIN_AVAILABLE" = "true" ]; then
+        echo "---> JWT REST authentication plugin found"
+        AUTH_PLUGINS="rest_auth/jwt"
+        mkdir -p /var/spool/slurm
+        chown slurm:slurm /var/spool/slurm
+    fi
+    
+    if [ "$MUNGE_PLUGIN_AVAILABLE" = "true" ]; then
+        echo "---> MUNGE/local REST authentication plugin found"
+        if [ -n "$AUTH_PLUGINS" ]; then
+            AUTH_PLUGINS="$AUTH_PLUGINS,rest_auth/local"
+        else
+            AUTH_PLUGINS="rest_auth/local"
+        fi
+    fi
+    
+    # Start slurmrestd with appropriate authentication plugins.
+    # SLURM_JWT=daemon activates auth/jwt as primary auth (see slurm.schedmd.com/jwt.html).
+    if [ -n "$AUTH_PLUGINS" ]; then
+        echo "---> Using authentication plugins: $AUTH_PLUGINS"
+        export SLURM_JWT=daemon
+        exec gosu slurmrest /usr/sbin/slurmrestd -a "$AUTH_PLUGINS" -vvv unix:/var/run/slurmrestd/slurmrestd.socket 0.0.0.0:6820
+    else
+        echo "---> No specific auth plugins found, using defaults (Unix socket only)"
+        exec gosu slurmrest /usr/sbin/slurmrestd -vvv unix:/var/run/slurmrestd/slurmrestd.socket 0.0.0.0:6820
+    fi
 fi
 
 if [ "$1" = "slurmd" ]

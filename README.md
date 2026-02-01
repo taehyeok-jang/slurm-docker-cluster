@@ -250,6 +250,14 @@ make rebuild
 
 This makes it easy to add/remove nodes or test new configuration settings dynamically.
 
+### REST API and JWT Authentication
+
+The REST API daemon (slurmrestd) supports JWT authentication for network access. **The JWT HS256 key (`jwt_hs256.key`) is not auto-generated**—the Slurm admin must create it in the StateSaveLocation (`/var/lib/slurm`) with correct ownership (`slurm:slurm`) and permissions (`0600`).
+
+- Create the key: `docker exec -it slurmctld init-jwt-key.sh`
+- Generate tokens: `./generate-jwt-token.sh`
+- Full guide (JWT setup, auth methods, how JWT works, auth layer for restricted access): [REST_API_AUTH.md](REST_API_AUTH.md)
+
 ## 📖 Common Workflows
 
 ### Using Make (Recommended)

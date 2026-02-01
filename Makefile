@@ -1,4 +1,4 @@
-.PHONY: help build up start down clean logs test status shell logs-slurmctld logs-slurmdbd update-slurm reload-slurm version set-version build-all test-all test-version
+.PHONY: help build build-no-cache build-tag up start down clean logs test status shell logs-slurmctld logs-slurmdbd update-slurm reload-slurm version set-version build-all test-all test-version
 
 # Default target
 .DEFAULT_GOAL := help
@@ -17,6 +17,8 @@ help:  ## Show this help message
 	@echo ""
 	@echo "Cluster Management:"
 	@printf "  ${CYAN}%-15s${RESET} %s\n" "build" "Build Docker images"
+	@printf "  ${CYAN}%-15s${RESET} %s\n" "build-no-cache" "Build Docker images (no cache, use after Dockerfile changes)"
+	@printf "  ${CYAN}%-15s${RESET} %s\n" "build-tag" "Build with custom tag (requires TAG=...)"
 	@printf "  ${CYAN}%-15s${RESET} %s\n" "up" "Start containers"
 	@printf "  ${CYAN}%-15s${RESET} %s\n" "down" "Stop containers"
 	@printf "  ${CYAN}%-15s${RESET} %s\n" "clean" "Remove containers and volumes"
@@ -50,9 +52,17 @@ help:  ## Show this help message
 	@echo "  make update-slurm FILES=\"slurm.conf slurmdbd.conf\""
 	@echo "  make set-version VER=24.11.6"
 	@echo "  make test-version VER=24.11.6"
+	@echo "  make build-tag TAG=dev"
 
 build:  ## Build Docker images
 	docker compose --progress plain build
+
+build-no-cache:  ## Build Docker images without cache (use after Dockerfile or dependency changes)
+	docker compose build --no-cache --progress plain
+
+build-tag:  ## Build with custom image tag (e.g. make build-tag TAG=dev)
+	@if [ -z "$(TAG)" ]; then echo "Usage: make build-tag TAG=<your-tag>"; exit 1; fi
+	IMAGE_TAG=$(TAG) docker compose --progress plain build
 
 up:  ## Start containers
 	docker compose up -d
